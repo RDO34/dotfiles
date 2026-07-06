@@ -14,6 +14,7 @@ tmux/     → ~/.tmux.conf
 ghostty/  → ~/.config/ghostty/config
 git/      → ~/.gitconfig ~/.config/git/ignore
 nvim/     → ~/.config/nvim (LazyVim)
+scripts/  → ~/bin (session, session-main)
 Brewfile  → tools installed via `brew bundle`
 bootstrap.sh / Makefile → install + link
 ```

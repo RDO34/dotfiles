@@ -1,0 +1,386 @@
+#!/usr/bin/env bash
+# session — create a git worktree + tmux *session* with three windows:
+#   1: claude  (agent)
+#   2: nvim    (editor)
+#   3: zsh     (shell)
+#
+# Repo:   $SESSION_DEFAULT_REPOS_DIR/$SESSION_DEFAULT_REPO (override with --repos-dir/--repo)
+# Base:   remote default     (override with --from or SESSION_DEFAULT_START)
+# Agent:  "claude"           (override with --agent-cmd or AGENT_CMD)
+
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage:
+  session <branch> [options]
+
+Git/branch:
+  --existing              Use existing branch if present (local or origin/<branch>), else error.
+  --from <start>          Start point for new branch (default: origin/<branch> or the remote default branch).
+  --force                 When creating a branch, reset it to <start> (-B).
+
+Repo selection:
+  --repos-dir, -d <path>  Directory containing repos (default: $SESSION_DEFAULT_REPOS_DIR or ~/projects).
+  --repo, -r <name>       Repo name within repos-dir (default: $SESSION_DEFAULT_REPO; required).
+
+Worktree:
+  --dir <path>            Worktree directory (default: <repos-dir>/<repo>--<safe-branch>).
+
+Agent:
+  --agent-cmd "<cmd>"     Command to run in claude window (default: $AGENT_CMD or "claude").
+  --no-agent              Create the claude window but do not start agent.
+
+Attach:
+  --no-attach             Do not attach to the new session.
+  -h, --help              Show help.
+
+Env:
+  SESSION_DEFAULT_REPOS_DIR  Default: $HOME/projects
+  SESSION_DEFAULT_REPO       Repo name within repos-dir (required if --repo omitted).
+  SESSION_DEFAULT_START           Default: remote default branch (origin/HEAD), else origin/main or origin/master
+  AGENT_CMD                  Default: claude --enable-auto-mode
+EOF
+}
+
+# --- defaults
+repos_dir="${SESSION_DEFAULT_REPOS_DIR:-$HOME/projects}"
+repo="${SESSION_DEFAULT_REPO:-}"
+DEFAULT_START="${SESSION_DEFAULT_START:-}"
+AGENT_CMD_DEFAULT="${AGENT_CMD:-claude --enable-auto-mode}"
+
+# --- parse args
+existing=false
+force=false
+start=""
+dir=""
+agent_cmd="$AGENT_CMD_DEFAULT"
+run_agent=true
+attach_tmux=true
+branch=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+  --existing)
+    existing=true
+    shift
+    ;;
+  --force)
+    force=true
+    shift
+    ;;
+  --from)
+    start="${2:?--from requires a value}"
+    shift 2
+    ;;
+  --repos-dir | -d)
+    repos_dir="${2:?--repos-dir requires a value}"
+    shift 2
+    ;;
+  --repo | -repo | -r)
+    repo="${2:?--repo requires a value}"
+    shift 2
+    ;;
+  --dir)
+    dir="${2:?--dir requires a value}"
+    shift 2
+    ;;
+  --agent-cmd)
+    agent_cmd="${2:?--agent-cmd requires a value}"
+    shift 2
+    ;;
+  --no-agent)
+    run_agent=false
+    shift
+    ;;
+  --no-attach)
+    attach_tmux=false
+    shift
+    ;;
+  -h | --help)
+    usage
+    exit 0
+    ;;
+  -*)
+    echo "Unknown option: $1"
+    usage
+    exit 1
+    ;;
+  *)
+    if [[ -z "$branch" ]]; then
+      branch="$1"
+      shift
+    else
+      echo "Unexpected positional arg: $1"
+      usage
+      exit 1
+    fi
+    ;;
+  esac
+done
+
+[[ -z "$branch" ]] && {
+  usage
+  exit 1
+}
+
+# --- resolve base repo
+[[ -z "$repo" ]] && {
+  echo "Error: no repo specified. Pass --repo <name> or set SESSION_DEFAULT_REPO."
+  exit 1
+}
+BASE_REPO="$repos_dir/$repo"
+
+# --- preflight
+for bin in git tmux; do
+  command -v "$bin" >/dev/null || {
+    echo "Error: '$bin' is required."
+    exit 1
+  }
+done
+
+[[ -d "$BASE_REPO" ]] || {
+  echo "Error: repo '$BASE_REPO' does not exist (check --repos-dir/--repo)."
+  exit 1
+}
+repo_abs="$(cd "$BASE_REPO" && pwd)"
+safe_branch="${branch//\//-}"
+session_name="$safe_branch"
+if [[ -z "$dir" ]]; then
+  parent="$(dirname "$repo_abs")"
+  repo_name="$(basename "$repo_abs")"
+  dir="$parent/${repo_name}--$safe_branch"
+fi
+
+# Helper: find worktree path for a branch (robust, no fragile pipelines)
+worktree_path_for_branch() {
+  local repo="$1" bname="$2" wt cur
+  while IFS= read -r line; do
+    case "$line" in
+    "worktree "*)
+      wt="${line#worktree }"
+      ;;
+    "branch "*)
+      cur="${line#branch }"
+      if [[ "$cur" == "refs/heads/$bname" ]]; then
+        printf '%s\n' "$wt"
+        return 0
+      fi
+      ;;
+    esac
+  done < <(git -C "$repo" worktree list --porcelain)
+  return 1
+}
+
+git -C "$repo_abs" fetch -p --quiet || true
+
+# Resolve default start point if not set: use remote HEAD, else probe main/master.
+# Validate every candidate — stale origin/HEAD or a stale SESSION_DEFAULT_START env can
+# point at a deleted/renamed branch.
+ref_exists() { git -C "$repo_abs" rev-parse --verify --quiet "$1" >/dev/null; }
+
+if [[ -n "$DEFAULT_START" ]] && ! ref_exists "$DEFAULT_START"; then
+  echo "⚠ SESSION_DEFAULT_START='$DEFAULT_START' not found in '$repo_abs'; auto-detecting default branch."
+  DEFAULT_START=""
+fi
+
+if [[ -z "$DEFAULT_START" ]]; then
+  remote_head="$(git -C "$repo_abs" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)"
+  if [[ -z "$remote_head" ]] || ! ref_exists "$remote_head"; then
+    git -C "$repo_abs" remote set-head origin --auto >/dev/null 2>&1 || true
+    remote_head="$(git -C "$repo_abs" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)"
+  fi
+  if [[ -n "$remote_head" ]] && ref_exists "$remote_head"; then
+    DEFAULT_START="$remote_head"
+  elif ref_exists refs/remotes/origin/main; then
+    DEFAULT_START="origin/main"
+  elif ref_exists refs/remotes/origin/master; then
+    DEFAULT_START="origin/master"
+  else
+    echo "Error: cannot determine default branch for '$repo_abs' (no origin/HEAD, origin/main, or origin/master)."
+    echo "  Pass --from <start> explicitly."
+    exit 1
+  fi
+fi
+
+# Prune stale worktree entries early (directory deleted but still registered)
+git -C "$repo_abs" worktree prune
+
+# If branch already has a worktree, reuse it
+reuse_existing_wt=false
+branch_in_use_path="$(worktree_path_for_branch "$repo_abs" "$branch" || true)"
+if [[ -n "$branch_in_use_path" ]]; then
+  reuse_existing_wt=true
+  if [[ -n "${dir:-}" && "$dir" != "$branch_in_use_path" ]]; then
+    echo "ℹ Branch '$branch' is already checked out at: $branch_in_use_path"
+    echo "  Using that worktree and ignoring --dir."
+  fi
+  dir="$branch_in_use_path"
+fi
+
+local_exists=false
+remote_exists=false
+git -C "$repo_abs" rev-parse --verify --quiet "refs/heads/$branch" >/dev/null && local_exists=true
+git -C "$repo_abs" rev-parse --verify --quiet "refs/remotes/origin/$branch" >/dev/null && remote_exists=true
+
+mkdir -p "$(dirname "$dir")"
+
+if ! $reuse_existing_wt; then
+  # If directory already exists, try to recover
+  if [[ -d "$dir" ]]; then
+    if [[ -f "$dir/.git" ]]; then
+      # Check if branch is still tracked after pruning
+      if worktree_path_for_branch "$repo_abs" "$branch" >/dev/null 2>&1; then
+        reuse_existing_wt=true
+        dir="$(worktree_path_for_branch "$repo_abs" "$branch")"
+      else
+        # Directory exists with .git but is orphaned — remove and re-create
+        rm -rf "$dir"
+      fi
+    else
+      echo "Error: '$dir' already exists and is not a git worktree."
+      echo "  Remove it manually or use --dir to specify a different path."
+      exit 1
+    fi
+  fi
+
+  if $reuse_existing_wt; then
+    echo "✔ Recovered orphaned worktree: $dir (branch: $branch)"
+  else
+    if $existing; then
+      if $local_exists; then
+        git -C "$repo_abs" worktree add "$dir" "$branch"
+      elif $remote_exists; then
+        git -C "$repo_abs" worktree add "$dir" -b "$branch" "origin/$branch"
+      else
+        echo "Error: branch '$branch' does not exist locally or on origin (use without --existing or supply --from)."
+        exit 3
+      fi
+    else
+      if $local_exists; then
+        git -C "$repo_abs" worktree add "$dir" "$branch"
+      else
+        [[ -z "$start" ]] && {
+          if $remote_exists; then
+            start="origin/$branch"
+          else
+            start="$DEFAULT_START"
+          fi
+        }
+        flag="-b"
+        $force && flag="-B"
+        git -C "$repo_abs" worktree add "$dir" $flag "$branch" "$start"
+      fi
+    fi
+
+    # Set upstream if available and not already set
+    if $remote_exists; then
+      if ! git -C "$dir" rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1; then
+        git -C "$dir" branch --set-upstream-to="origin/$branch" >/dev/null || true
+      fi
+    fi
+
+    echo "✔ Worktree ready: $dir (branch: $branch)"
+  fi
+else
+  echo "✔ Reusing existing worktree: $dir (branch: $branch)"
+fi
+
+# --- copy config files from base repo to worktree
+copy_config() {
+  local src="$repo_abs/$1"
+  local dst="$dir/$1"
+  if [[ -f "$src" ]]; then
+    mkdir -p "$(dirname "$dst")"
+    cp "$src" "$dst"
+  fi
+}
+
+# Always copy the .local dir from the base repo if present
+if [[ -d "$repo_abs/.local" ]]; then
+  cp -R "$repo_abs/.local" "$dir/"
+  echo "✔ Copied .local dir to worktree"
+fi
+
+# Claude local settings
+copy_config ".claude/settings.local.json"
+
+# Secret/config files from scripts/secrets-config.json
+secrets_cfg="$repo_abs/scripts/secrets-config.json"
+if [[ -f "$secrets_cfg" ]] && command -v jq >/dev/null 2>&1; then
+  while IFS= read -r rel_path; do
+    copy_config "$rel_path"
+  done < <(jq -r '.secrets[].path' "$secrets_cfg")
+  echo "✔ Copied config files to worktree"
+elif [[ -f "$secrets_cfg" ]]; then
+  echo "⚠ Warning: 'jq' not found; skipping secrets-config copy."
+fi
+
+# --- tmux session with three windows
+# Ensure the tmux socket dir exists — macOS periodically purges /tmp, which can
+# delete it out from under a running server and break every subsequent command.
+tmux_tmpdir="${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)"
+mkdir -p "$tmux_tmpdir" && chmod 700 "$tmux_tmpdir"
+
+# If session already exists, just attach to it
+if tmux has-session -t "$session_name" 2>/dev/null; then
+  echo "ℹ Session '$session_name' already exists."
+  if $attach_tmux; then
+    if [[ -n "${TMUX-}" ]]; then
+      tmux switch-client -t "$session_name"
+    else
+      tmux attach -t "$session_name"
+    fi
+  else
+    echo "  Attach with: tmux attach -t $session_name"
+  fi
+  exit 0
+fi
+
+# Create session with first window: claude
+tmux new-session -d -s "$session_name" -n "claude" -c "$dir"
+
+# Window 1: claude — set env and optionally launch agent
+claude_pane="$(tmux list-panes -t "${session_name}:claude" -F '#{pane_id}' | head -1)"
+tmux send-keys -t "$claude_pane" 'export NX_DAEMON=false TMPDIR="$PWD/.tmp"; mkdir -p .tmp' C-m
+
+if $run_agent; then
+  first_word="${agent_cmd%% *}"
+  if command -v "$first_word" >/dev/null 2>&1; then
+    tmux send-keys -t "$claude_pane" "clear && $agent_cmd" C-m
+  else
+    echo "⚠ Warning: '$first_word' not found in PATH; agent not started."
+    tmux send-keys -t "$claude_pane" 'clear' C-m
+  fi
+else
+  tmux send-keys -t "$claude_pane" 'clear' C-m
+fi
+
+# Window 2: nvim
+tmux new-window -t "$session_name" -n "nvim" -c "$dir"
+tmux send-keys -t "${session_name}:nvim" 'clear' C-m
+if command -v nvim >/dev/null 2>&1; then
+  tmux send-keys -t "${session_name}:nvim" 'nvim .' C-m
+else
+  tmux send-keys -t "${session_name}:nvim" 'vim . || vi .' C-m
+fi
+
+# Window 3: zsh
+tmux new-window -t "$session_name" -n "zsh" -c "$dir"
+tmux send-keys -t "${session_name}:zsh" 'clear' C-m
+
+# Select the claude window
+tmux select-window -t "${session_name}:claude"
+
+echo "✔ Session '$session_name' created with windows: claude, nvim, zsh"
+
+# Attach or switch
+if $attach_tmux; then
+  if [[ -n "${TMUX-}" ]]; then
+    tmux switch-client -t "$session_name"
+  else
+    tmux attach -t "$session_name"
+  fi
+else
+  echo "ℹ Attach with: tmux attach -t $session_name"
+fi

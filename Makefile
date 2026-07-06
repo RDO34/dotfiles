@@ -1,4 +1,4 @@
-PACKAGES := zsh tmux ghostty git nvim
+PACKAGES := zsh tmux ghostty git nvim scripts
 
 .PHONY: install brew stow unstow restow
 

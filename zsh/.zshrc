@@ -152,9 +152,6 @@ export PKG_CONFIG_PATH="/opt/homebrew/opt/pixman/lib/pkgconfig"
 export CLOUDSDK_PYTHON=/opt/homebrew/bin/python3.13
 . "$HOME/.deno/env"
 
-export PX_BASE_REPO="$HOME/projects/phoenix"
-export PX_DEFAULT_START="origin/master"
-
 export PATH="$HOME/bin:$PATH"
 
 export AGENT_CMD="codex -a='untrusted'"
@@ -178,7 +175,7 @@ export PATH="/opt/homebrew/bin:$(go env GOPATH)/bin:$PATH"
 
 # session script defaults
 export SESSION_DEFAULT_REPOS_DIR="$HOME/projects"
-export SESSION_DEFAULT_REPO="phoenix"
+# export SESSION_DEFAULT_REPO="<your-default-repo>"
 
 # Android SDK (Expo / React Native)
 export ANDROID_HOME="$HOME/Library/Android/sdk"

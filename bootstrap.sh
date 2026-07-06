@@ -2,7 +2,7 @@
 set -euo pipefail
 
 DOTFILES="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PACKAGES=(zsh tmux ghostty git nvim)
+PACKAGES=(zsh tmux ghostty git nvim scripts)
 
 log() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 

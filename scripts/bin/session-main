@@ -1,0 +1,177 @@
+#!/usr/bin/env bash
+# session-main — open a tmux session against the main repo (no worktree):
+#   1: claude  (agent)
+#   2: nvim    (editor)
+#   3: zsh     (shell)
+#
+# Repo:   $SESSION_DEFAULT_REPOS_DIR/$SESSION_DEFAULT_REPO (override with --repos-dir/--repo)
+# Agent:  "claude"           (override with --agent-cmd or AGENT_CMD)
+
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage:
+  session-main [session-name] [options]
+
+Arguments:
+  session-name              tmux session name (default: the repo name).
+
+Repo selection:
+  --repos-dir, -d <path>    Directory containing repos (default: $SESSION_DEFAULT_REPOS_DIR or ~/projects).
+  --repo, -r <name>         Repo name within repos-dir (default: $SESSION_DEFAULT_REPO; required).
+
+Agent:
+  --agent-cmd "<cmd>"       Command to run in claude window (default: $AGENT_CMD or "claude").
+  --no-agent                Create the claude window but do not start agent.
+
+Attach:
+  --no-attach               Do not attach to the new session.
+  -h, --help                Show help.
+
+Env:
+  SESSION_DEFAULT_REPOS_DIR Default: $HOME/projects
+  SESSION_DEFAULT_REPO      Repo name within repos-dir (required if --repo omitted).
+  AGENT_CMD                 Default: claude --enable-auto-mode
+EOF
+}
+
+# --- defaults
+repos_dir="${SESSION_DEFAULT_REPOS_DIR:-$HOME/projects}"
+repo="${SESSION_DEFAULT_REPO:-}"
+AGENT_CMD_DEFAULT="${AGENT_CMD:-claude --enable-auto-mode}"
+
+# --- parse args
+session_name=""
+agent_cmd="$AGENT_CMD_DEFAULT"
+run_agent=true
+attach_tmux=true
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+  --repos-dir | -d)
+    repos_dir="${2:?--repos-dir requires a value}"
+    shift 2
+    ;;
+  --repo | -r)
+    repo="${2:?--repo requires a value}"
+    shift 2
+    ;;
+  --agent-cmd)
+    agent_cmd="${2:?--agent-cmd requires a value}"
+    shift 2
+    ;;
+  --no-agent)
+    run_agent=false
+    shift
+    ;;
+  --no-attach)
+    attach_tmux=false
+    shift
+    ;;
+  -h | --help)
+    usage
+    exit 0
+    ;;
+  -*)
+    echo "Unknown option: $1"
+    usage
+    exit 1
+    ;;
+  *)
+    if [[ -z "$session_name" ]]; then
+      session_name="$1"
+    else
+      echo "Unknown arg: $1"
+      usage
+      exit 1
+    fi
+    shift
+    ;;
+  esac
+done
+
+[[ -z "$repo" ]] && {
+  echo "Error: no repo specified. Pass --repo <name> or set SESSION_DEFAULT_REPO."
+  exit 1
+}
+[[ -z "$session_name" ]] && session_name="$repo"
+
+# --- resolve base repo
+BASE_REPO="$repos_dir/$repo"
+
+# --- preflight
+for bin in git tmux; do
+  command -v "$bin" >/dev/null || {
+    echo "Error: '$bin' is required."
+    exit 1
+  }
+done
+
+[[ -d "$BASE_REPO" ]] || {
+  echo "Error: repo '$BASE_REPO' does not exist (check --repos-dir/--repo)."
+  exit 1
+}
+repo_abs="$(cd "$BASE_REPO" && pwd)"
+
+# --- tmux session with three windows
+# If session already exists, just attach to it
+if tmux has-session -t "=$session_name" 2>/dev/null; then
+  echo "Session '$session_name' already exists."
+  if $attach_tmux; then
+    if [[ -n "${TMUX-}" ]]; then
+      tmux switch-client -t "$session_name"
+    else
+      tmux attach -t "$session_name"
+    fi
+  else
+    echo "  Attach with: tmux attach -t $session_name"
+  fi
+  exit 0
+fi
+
+# Create session with first window: claude
+tmux new-session -d -s "$session_name" -n "claude" -c "$repo_abs"
+
+# Window 1: claude — set env and optionally launch agent
+claude_pane="$(tmux list-panes -t "${session_name}:claude" -F '#{pane_id}' | head -1)"
+tmux send-keys -t "$claude_pane" 'export NX_DAEMON=false TMPDIR="$PWD/.tmp"; mkdir -p .tmp' C-m
+tmux send-keys -t "$claude_pane" 'clear' C-m
+
+if $run_agent; then
+  first_word="${agent_cmd%% *}"
+  if command -v "$first_word" >/dev/null 2>&1; then
+    tmux send-keys -t "$claude_pane" "$agent_cmd" C-m
+  else
+    echo "Warning: '$first_word' not found in PATH; agent not started."
+  fi
+fi
+
+# Window 2: nvim
+tmux new-window -t "$session_name" -n "nvim" -c "$repo_abs"
+tmux send-keys -t "${session_name}:nvim" 'clear' C-m
+if command -v nvim >/dev/null 2>&1; then
+  tmux send-keys -t "${session_name}:nvim" 'nvim .' C-m
+else
+  tmux send-keys -t "${session_name}:nvim" 'vim . || vi .' C-m
+fi
+
+# Window 3: zsh
+tmux new-window -t "$session_name" -n "zsh" -c "$repo_abs"
+tmux send-keys -t "${session_name}:zsh" 'clear' C-m
+
+# Select the claude window
+tmux select-window -t "${session_name}:claude"
+
+echo "Session '$session_name' created with windows: claude, nvim, zsh (repo: $repo_abs)"
+
+# Attach or switch
+if $attach_tmux; then
+  if [[ -n "${TMUX-}" ]]; then
+    tmux switch-client -t "$session_name"
+  else
+    tmux attach -t "$session_name"
+  fi
+else
+  echo "  Attach with: tmux attach -t $session_name"
+fi
