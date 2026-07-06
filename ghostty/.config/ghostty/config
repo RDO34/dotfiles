@@ -1,0 +1,11 @@
+theme = "TokyoNight Storm"
+background-opacity = 0.90
+background-blur = true
+window-padding-x = 24
+window-padding-y = 24
+font-size = 18
+macos-option-as-alt = true
+keybind = alt+shift+minus=text:—
+keybind = alt+semicolon=text:…
+keybind = alt+three=text:#
+
