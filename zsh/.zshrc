@@ -165,11 +165,6 @@ export PATH=$HOME/.opencode/bin:$PATH
 
 function nav() { cd "$(command nav "$@")" }
 
-function ns() {
-  local name="${1:?Usage: ns <name> [path]}"
-  local dir="${2:-$PWD}"
-  tmux new-session -d -s "$name" -c "$dir" && tmux switch-client -t "$name"
-}
 
 export PATH="/opt/homebrew/bin:$(go env GOPATH)/bin:$PATH"
 

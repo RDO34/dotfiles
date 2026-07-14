@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+name="${1:?Usage: ns <name> [path]}"
+dir="${2:-$PWD}"
+
+tmux new-session -d -s "$name" -c "$dir"
+tmux switch-client -t "$name"
