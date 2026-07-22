@@ -120,6 +120,7 @@ alias cc="claude --enable-auto-mode"
 alias oc="opencode"
 alias lg="lazygit"
 alias ls="eza --icons --group-directories-first"
+alias tf="terraform"
 
 export NVIM_PYTHON_LOG_FILE="$HOME/.nvim_python_logs"
 
